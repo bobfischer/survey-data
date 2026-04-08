@@ -20,8 +20,8 @@ function buildBreakdown(responses: Record<string, string>[], question: { id: str
 
     for (const row of responses) {
       for (const col of columns) {
-        const val = row[col];
-        if (val && val.trim() !== '' && val !== '0') counts[col]++;
+        const val = (row[col] || '').trim();
+        if (val === 'Selected' || val === '1' || val === 'Yes') counts[col]++;
       }
     }
 
@@ -36,42 +36,51 @@ function buildBreakdown(responses: Record<string, string>[], question: { id: str
 
   if (question.type === 'ranking') {
     const columns = question.columns ?? question.options ?? [];
-    const items: Record<string, { ranks: number[]; total: number }> = {};
-    for (const col of columns) items[col] = { ranks: [], total: 0 };
+    const items: Record<string, Record<string, number>> = {};
+    for (const col of columns) items[col] = {};
 
     for (const row of responses) {
       for (const col of columns) {
-        const val = row[col];
-        if (val && val.trim() !== '') {
-          const rank = parseInt(val, 10);
-          if (!isNaN(rank)) {
-            items[col].ranks.push(rank);
-            items[col].total++;
-          }
+        const val = (row[col] || '').trim();
+        if (val) {
+          items[col][val] = (items[col][val] || 0) + 1;
         }
       }
     }
 
-    return Object.entries(items)
-      .map(([item, data]) => ({
+    const breakdown = Object.entries(items).map(([item, distribution]) => {
+      const respondents = Object.values(distribution).reduce((a, b) => a + b, 0);
+      return {
         item,
-        responses: data.total,
-        average_rank: data.total > 0 ? Math.round((data.ranks.reduce((a, b) => a + b, 0) / data.total) * 100) / 100 : null,
-      }))
-      .sort((a, b) => (a.average_rank ?? 999) - (b.average_rank ?? 999));
+        respondents,
+        distribution: Object.entries(distribution)
+          .map(([value, count]) => ({ value, count, percentage: respondents > 0 ? Math.round((count / respondents) * 1000) / 10 : 0 }))
+          .sort((a, b) => b.count - a.count),
+      };
+    });
+
+    breakdown.sort((a, b) => {
+      const aTop = a.distribution.find(d => d.value.includes('High'))?.percentage ?? 0;
+      const bTop = b.distribution.find(d => d.value.includes('High'))?.percentage ?? 0;
+      return bTop - aTop;
+    });
+
+    return breakdown;
   }
 
   if (question.type === 'open') {
+    const primaryCol = question.columns?.find((c: string) => !c.endsWith('_oe')) || question.columns?.[0] || question.id;
     const texts = responses
-      .map((r) => r[question.id])
+      .map((r) => r[primaryCol])
       .filter((v) => v && v.trim() !== '');
     return { response_count: texts.length, responses: texts };
   }
 
-  // Single-select
+  // Single-select — use the actual column name, not question ID
+  const primaryCol = question.columns?.find((c: string) => !c.endsWith('_oe')) || question.columns?.[0] || question.id;
   const counts: Record<string, number> = {};
   for (const row of responses) {
-    const val = row[question.id];
+    const val = row[primaryCol];
     if (val && val.trim() !== '') counts[val] = (counts[val] ?? 0) + 1;
   }
 

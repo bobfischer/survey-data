@@ -3,169 +3,123 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { getQuestion, getResponses, filterResponses } from '../db.js';
 
 export const getQuestionBreakdownSchema = {
-  question_id: z.string().describe('The question ID (e.g. "Q3")'),
+  question_ids: z.union([z.string(), z.array(z.string())]).describe('One or more question IDs (e.g. "Q3" or ["Q3", "Q5", "Q8"])'),
   dataset: z.enum(['all', 'exec']).default('all').describe('Which dataset to use'),
   filter_field: z.string().optional().describe('Demographic field to filter on (e.g. "Q1", "Q2", "Age")'),
   filter_value: z.string().optional().describe('Value to filter for within the filter field'),
 };
 
+function breakdownOne(question_id: string, dataset: 'all' | 'exec', filter_field?: string, filter_value?: string) {
+  const question = getQuestion(question_id);
+  if (!question) return { error: `Question ${question_id} not found` };
+
+  const responses = filter_field && filter_value
+    ? filterResponses(dataset, { [filter_field]: filter_value })
+    : getResponses(dataset);
+  const total = responses.length;
+
+  return { question, responses, total };
+}
+
 export async function handleGetQuestionBreakdown({
-  question_id,
+  question_ids,
   dataset,
   filter_field,
   filter_value,
 }: {
-  question_id: string;
+  question_ids: string | string[];
   dataset: 'all' | 'exec';
   filter_field?: string;
   filter_value?: string;
 }) {
-  const question = getQuestion(question_id);
-  if (!question) {
-    return { content: [{ type: 'text' as const, text: JSON.stringify({ error: `Question ${question_id} not found` }) }] };
-  }
-
-  const responses =
-    filter_field && filter_value
-      ? filterResponses(dataset, { [filter_field]: filter_value })
-      : getResponses(dataset);
-
+  const ids = Array.isArray(question_ids) ? question_ids : [question_ids];
+  const responses = filter_field && filter_value
+    ? filterResponses(dataset, { [filter_field]: filter_value })
+    : getResponses(dataset);
   const total = responses.length;
 
-  if (question.type === 'open') {
-    const texts = responses
-      .map((r) => r[question_id])
-      .filter((v) => v && v.trim() !== '');
+  const results = ids.map((qid) => buildBreakdownResult(qid, responses, total, dataset));
 
-    return {
-      content: [
-        {
-          type: 'text' as const,
-          text: JSON.stringify(
-            { question_id, question_text: question.text, type: question.type, dataset, total_respondents: total, response_count: texts.length, responses: texts },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
+  // If single question, return flat; if multiple, return array
+  const output = results.length === 1 ? results[0] : results;
+
+  return {
+    content: [{ type: 'text' as const, text: JSON.stringify(output, null, 2) }],
+  };
+}
+
+function buildBreakdownResult(question_id: string, responses: Record<string, string>[], total: number, dataset: string) {
+  const question = getQuestion(question_id);
+  if (!question) return { question_id, error: `Question ${question_id} not found` };
+
+  if (question.type === 'open') {
+    const primaryCol = question.columns.find(c => !c.endsWith('_oe')) || question.columns[0];
+    const texts = responses.map((r) => r[primaryCol]).filter((v) => v && v.trim() !== '');
+    return { question_id, question_text: question.text, type: question.type, dataset, total_respondents: total, response_count: texts.length, responses: texts };
   }
 
   if (question.type === 'ranking') {
-    // For ranking questions, each column represents a ranked item
-    // Calculate average rank and distribution for each item
     const columns = question.columns ?? question.options ?? [];
-    const items: Record<string, { ranks: number[]; total: number }> = {};
-
-    for (const col of columns) {
-      items[col] = { ranks: [], total: 0 };
-    }
+    const items: Record<string, Record<string, number>> = {};
+    for (const col of columns) items[col] = {};
 
     for (const row of responses) {
       for (const col of columns) {
-        const val = row[col];
-        if (val && val.trim() !== '') {
-          const rank = parseInt(val, 10);
-          if (!isNaN(rank)) {
-            items[col].ranks.push(rank);
-            items[col].total++;
-          }
-        }
+        const val = (row[col] || '').trim();
+        if (val) items[col][val] = (items[col][val] || 0) + 1;
       }
     }
 
-    const breakdown = Object.entries(items).map(([item, data]) => ({
-      item,
-      responses: data.total,
-      average_rank: data.total > 0 ? Math.round((data.ranks.reduce((a, b) => a + b, 0) / data.total) * 100) / 100 : null,
-    }));
+    const breakdown = Object.entries(items).map(([item, distribution]) => {
+      const respondents = Object.values(distribution).reduce((a, b) => a + b, 0);
+      return {
+        item, respondents,
+        distribution: Object.entries(distribution)
+          .map(([value, count]) => ({ value, count, percentage: respondents > 0 ? Math.round((count / respondents) * 1000) / 10 : 0 }))
+          .sort((a, b) => b.count - a.count),
+      };
+    });
+    breakdown.sort((a, b) => {
+      const aTop = a.distribution.find(d => d.value.includes('High'))?.percentage ?? 0;
+      const bTop = b.distribution.find(d => d.value.includes('High'))?.percentage ?? 0;
+      return bTop - aTop;
+    });
 
-    breakdown.sort((a, b) => (a.average_rank ?? 999) - (b.average_rank ?? 999));
-
-    return {
-      content: [
-        {
-          type: 'text' as const,
-          text: JSON.stringify(
-            { question_id, question_text: question.text, type: question.type, dataset, total_respondents: total, breakdown },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
+    return { question_id, question_text: question.text, type: question.type, dataset, total_respondents: total, breakdown };
   }
 
   if (question.type === 'multi') {
-    // Multi-select: each option is a separate column; count respondents who selected each
     const columns = question.columns ?? question.options ?? [];
     const counts: Record<string, number> = {};
-
-    for (const col of columns) {
-      counts[col] = 0;
-    }
+    for (const col of columns) counts[col] = 0;
 
     for (const row of responses) {
       for (const col of columns) {
-        const val = row[col];
-        if (val && val.trim() !== '' && val !== '0') {
-          counts[col]++;
-        }
+        const val = (row[col] || '').trim();
+        if (val === 'Selected' || val === '1' || val === 'Yes') counts[col]++;
       }
     }
 
-    const breakdown = Object.entries(counts).map(([option, count]) => ({
-      option,
-      count,
-      percentage: total > 0 ? Math.round((count / total) * 1000) / 10 : 0,
-    }));
+    const breakdown = Object.entries(counts)
+      .map(([option, count]) => ({ option, count, percentage: total > 0 ? Math.round((count / total) * 1000) / 10 : 0 }))
+      .sort((a, b) => b.count - a.count);
 
-    breakdown.sort((a, b) => b.count - a.count);
-
-    return {
-      content: [
-        {
-          type: 'text' as const,
-          text: JSON.stringify(
-            { question_id, question_text: question.text, type: question.type, dataset, total_respondents: total, breakdown },
-            null,
-            2,
-          ),
-        },
-      ],
-    };
+    return { question_id, question_text: question.text, type: question.type, dataset, total_respondents: total, breakdown };
   }
 
-  // Single-select: count each unique value
+  // Single-select
+  const primaryCol = question.columns.find(c => !c.endsWith('_oe')) || question.columns[0];
   const counts: Record<string, number> = {};
-
   for (const row of responses) {
-    const val = row[question_id];
-    if (val && val.trim() !== '') {
-      counts[val] = (counts[val] ?? 0) + 1;
-    }
+    const val = row[primaryCol];
+    if (val && val.trim() !== '') counts[val] = (counts[val] ?? 0) + 1;
   }
 
   const breakdown = Object.entries(counts)
-    .map(([value, count]) => ({
-      value,
-      count,
-      percentage: total > 0 ? Math.round((count / total) * 1000) / 10 : 0,
-    }))
+    .map(([value, count]) => ({ value, count, percentage: total > 0 ? Math.round((count / total) * 1000) / 10 : 0 }))
     .sort((a, b) => b.count - a.count);
 
-  return {
-    content: [
-      {
-        type: 'text' as const,
-        text: JSON.stringify(
-          { question_id, question_text: question.text, type: question.type, dataset, total_respondents: total, breakdown },
-          null,
-          2,
-        ),
-      },
-    ],
-  };
+  return { question_id, question_text: question.text, type: question.type, dataset, total_respondents: total, breakdown };
 }
 
 export function registerGetQuestionBreakdown(server: McpServer) {
