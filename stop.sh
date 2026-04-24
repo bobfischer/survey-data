@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+cd "$(dirname "$0")"
 source ~/bin/mcp-config/lib/vault.sh
 if vault_kill_port; then
   echo "✓ stopped $(vault_repo_name)"
